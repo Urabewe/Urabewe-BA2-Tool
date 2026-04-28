@@ -1,7 +1,7 @@
 """
 BA2 Manager — Standalone BA2 Archive Tool
 Combines BSA Browser + BAMgr functionality:
-  • Open and browse BA2 archives (General + DX10/Texture)
+  • Open and browse BA2 archives (General + DX10/Texture); open several at once to search across them
   • Extract single files, folders, or entire archives
   • Create new BA2 archives (General or DX10) with full settings
   • Add files to an existing archive
@@ -19,7 +19,7 @@ import struct
 import zlib
 import threading
 from pathlib import Path
-from typing import List, Optional, Dict
+from typing import List, Dict, Tuple
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -396,8 +396,6 @@ class BA2Archive:
                 out.write(raw)
 
     def _build_dds_header(self, e: BA2FileEntry) -> bytes:
-        """Build a DDS header compatible with common loaders (aligned with BSA Browser / Sharp.BSA.BA2)."""
-        # https://github.com/AlexxEG/BSA_Browser/blob/master/Sharp.BSA.BA2/BA2Util/BA2TextureEntry.cs
         DDS_FOURCC = 0x4
         DDS_RGB = 0x40
         DDS_RGBA = 0x41
@@ -576,7 +574,7 @@ class BA2Archive:
                 DDS_ALPHA_UNKNOWN,
             )
         elif int(e.tile_mode) != 8:
-            # Xbox tile mode: BSA appends DXT10 + tail; without full swizzle data, emit minimal DXT10.
+
             out += struct.pack(
                 "<IIIII",
                 fmt,
@@ -850,18 +848,22 @@ class ExtractWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, archive, entries, out_dir):
+    def __init__(self, items: List[Tuple["BA2Archive", BA2FileEntry]], out_dir: str, use_archive_subfolders: bool):
         super().__init__()
-        self.archive = archive
-        self.entries = entries
+        self.items = items
         self.out_dir = out_dir
+        self.use_archive_subfolders = use_archive_subfolders
 
     def run(self):
         try:
-            total = len(self.entries)
-            for i, e in enumerate(self.entries):
-                self.progress.emit(i, total, e.name)
-                self.archive.extract_file(e, self.out_dir)
+            total = len(self.items)
+            for i, (archive, e) in enumerate(self.items):
+                self.progress.emit(i, total, f"{os.path.basename(archive.path)} — {e.name}")
+                base = self.out_dir
+                if self.use_archive_subfolders:
+                    stem = Path(archive.path).stem
+                    base = os.path.join(self.out_dir, stem)
+                archive.extract_file(e, base)
             self.finished.emit(True, f"Extracted {total} file(s) to:\n{self.out_dir}")
         except Exception as ex:
             self.finished.emit(False, str(ex))
@@ -1447,7 +1449,7 @@ class WorkProgressDialog(QDialog):
 class BA2Manager(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.archive     : Optional[BA2Archive] = None
+        self.archives: List[BA2Archive] = []
         self.pending_adds: Dict[str, str] = {}
         self.deleted     : set            = set()
         self.replacements: Dict[str, str] = {}
@@ -1470,7 +1472,7 @@ class BA2Manager(QMainWindow):
         mb = self.menuBar()
 
         fm = mb.addMenu("&File")
-        self.act_open    = fm.addAction("&Open BA2 Archive…",   self._open_archive,   "Ctrl+O")
+        self.act_open    = fm.addAction("&Open BA2 Archive(s)…", self._open_archive,   "Ctrl+O")
         self.act_close   = fm.addAction("&Close Archive",        self._close_archive,  "Ctrl+W")
         fm.addSeparator()
         self.act_new     = fm.addAction("&New Archive…",         self._new_archive,    "Ctrl+N")
@@ -1511,7 +1513,7 @@ class BA2Manager(QMainWindow):
             a = QAction(label, self); a.setToolTip(tip); a.triggered.connect(slot)
             tb.addAction(a); return a
 
-        self.tb_open    = act("Open",         "Open BA2 archive",                 self._open_archive)
+        self.tb_open    = act("Open",         "Open one or more BA2 archives",   self._open_archive)
         self.tb_new     = act("New",          "Create a new BA2 archive",         self._new_archive)
         self.tb_save    = act("Save",         "Rebuild and save archive",         self._save_archive)
         tb.addSeparator()
@@ -1572,9 +1574,9 @@ class BA2Manager(QMainWindow):
 
         # ── Tab 1: File list ─────────────────────────────────────────────────
         self.file_table = QTableWidget()
-        self.file_table.setColumnCount(7)
+        self.file_table.setColumnCount(8)
         self.file_table.setHorizontalHeaderLabels(
-            ["Filename", "Internal Path", "Unpacked Size", "Compressed",
+            ["BA2", "Filename", "Internal Path", "Unpacked Size", "Compressed",
              "DXGI Format", "Dimensions", "Mips"]
         )
         self.file_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1585,13 +1587,14 @@ class BA2Manager(QMainWindow):
         self.file_table.verticalHeader().setVisible(False)
         self.file_table.verticalHeader().setDefaultSectionSize(22)
         hh = self.file_table.horizontalHeader()
-        hh.setSectionResizeMode(0, QHeaderView.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(3, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         hh.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         self.file_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_table.customContextMenuRequested.connect(self._context_menu)
         self.file_table.doubleClicked.connect(self._on_double_click)
@@ -1630,40 +1633,97 @@ class BA2Manager(QMainWindow):
     # ── Archive open/close ────────────────────────────────────────────────────
 
     def _open_archive(self):
-        if self.dirty and not self._confirm_discard(): return
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open BA2 Archive", "", "BA2 Archives (*.ba2);;All Files (*)"
+        if self.dirty and not self._confirm_discard():
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Open BA2 Archive(s)", "", "BA2 Archives (*.ba2);;All Files (*)"
         )
-        if not path: return
-        arc = BA2Archive()
-        try:
-            arc.open(path)
-        except Exception as ex:
-            QMessageBox.critical(self, "Error Opening Archive", str(ex)); return
-        self._set_archive(arc)
+        if not paths:
+            return
+        loaded: List[BA2Archive] = []
+        errors: List[str] = []
+        for path in paths:
+            arc = BA2Archive()
+            try:
+                arc.open(path)
+                loaded.append(arc)
+            except Exception as ex:
+                errors.append(f"{os.path.basename(path)}: {ex}")
+        if not loaded:
+            QMessageBox.critical(
+                self, "Error Opening Archive(s)",
+                "Could not open any of the selected files:\n\n" + "\n".join(errors),
+            )
+            return
+        self._set_archives(loaded)
+        if errors:
+            QMessageBox.warning(
+                self, "Some archives failed",
+                "Opened %d archive(s). The following could not be opened:\n\n%s"
+                % (len(loaded), "\n".join(errors)),
+            )
 
     def _set_archive(self, arc: BA2Archive):
-        if self.archive: self.archive.close()
-        self.archive = arc
-        self.pending_adds.clear(); self.deleted.clear()
-        self.replacements.clear(); self.dirty = False
+        """Replace session with a single archive (used after create/save)."""
+        self._set_archives([arc])
+
+    def _set_archives(self, archives: List[BA2Archive]):
+        for a in self.archives:
+            a.close()
+        self.archives = list(archives)
+        self.pending_adds.clear()
+        self.deleted.clear()
+        self.replacements.clear()
+        self.dirty = False
         self._populate_folder_tree()
-        self._populate_file_table(arc.files)
+        self._repopulate_file_list_from_filter()
         self._update_info()
         self._update_pending_tab()
         self._refresh_statusbar()
         self._refresh_actions()
-        self.setWindowTitle(f"BA2 Manager  —  {os.path.basename(arc.path)}")
+        if len(self.archives) == 1:
+            self.setWindowTitle(f"BA2 Manager  —  {os.path.basename(self.archives[0].path)}")
+        elif self.archives:
+            self.setWindowTitle(f"BA2 Manager  —  {len(self.archives)} archives")
 
     def _close_archive(self):
-        if self.dirty and not self._confirm_discard(): return
-        if self.archive: self.archive.close(); self.archive = None
-        self.pending_adds.clear(); self.deleted.clear()
-        self.replacements.clear(); self.dirty = False
-        self.folder_tree.clear(); self.file_table.setRowCount(0)
-        self.info_text.clear(); self.pending_text.clear()
-        self._refresh_statusbar(); self._refresh_actions()
+        if self.dirty and not self._confirm_discard():
+            return
+        for a in self.archives:
+            a.close()
+        self.archives = []
+        self.pending_adds.clear()
+        self.deleted.clear()
+        self.replacements.clear()
+        self.dirty = False
+        self.folder_tree.clear()
+        self.file_table.setRowCount(0)
+        self.info_text.clear()
+        self.pending_text.clear()
+        self._refresh_statusbar()
+        self._refresh_actions()
         self.setWindowTitle("BA2 Manager")
+
+    def _all_arc_entries(self) -> List[Tuple[BA2Archive, BA2FileEntry]]:
+        return [(a, e) for a in self.archives for e in a.files]
+
+    def _repopulate_file_list_from_filter(self):
+        """Rebuild file table using current folder tree selection and filter text."""
+        if not self.archives:
+            self.file_table.setRowCount(0)
+            self._refresh_statusbar()
+            return
+        cur = self.folder_tree.currentItem()
+        folder = cur.data(0, Qt.UserRole) if cur else None
+        text = self.le_filter.text().lower()
+        items: List[Tuple[BA2Archive, BA2FileEntry]] = []
+        for arc, e in self._all_arc_entries():
+            if folder and not e.name.replace("\\", "/").startswith(folder):
+                continue
+            if text and text not in e.name.lower():
+                continue
+            items.append((arc, e))
+        self._populate_file_table(items)
 
     def _confirm_discard(self):
         r = QMessageBox.question(
@@ -1677,93 +1737,92 @@ class BA2Manager(QMainWindow):
 
     def _populate_folder_tree(self):
         self.folder_tree.clear()
-        if not self.archive: return
+        if not self.archives:
+            return
         root_item = QTreeWidgetItem(["📦  All Files"])
         root_item.setData(0, Qt.UserRole, None)
         self.folder_tree.addTopLevelItem(root_item)
         dirs: Dict[str, QTreeWidgetItem] = {}
-        for e in self.archive.files:
-            d = e.directory
-            if not d: continue
-            parts = d.replace("\\", "/").split("/")
-            parent = root_item; path_so_far = ""
-            for part in parts:
-                path_so_far = (path_so_far + "/" + part).lstrip("/")
-                if path_so_far not in dirs:
-                    item = QTreeWidgetItem(["📁  " + part])
-                    item.setData(0, Qt.UserRole, path_so_far)
-                    parent.addChild(item)
-                    dirs[path_so_far] = item
-                parent = dirs[path_so_far]
+        for arc in self.archives:
+            for e in arc.files:
+                d = e.directory
+                if not d:
+                    continue
+                parts = d.replace("\\", "/").split("/")
+                parent = root_item
+                path_so_far = ""
+                for part in parts:
+                    path_so_far = (path_so_far + "/" + part).lstrip("/")
+                    if path_so_far not in dirs:
+                        item = QTreeWidgetItem(["📁  " + part])
+                        item.setData(0, Qt.UserRole, path_so_far)
+                        parent.addChild(item)
+                        dirs[path_so_far] = item
+                    parent = dirs[path_so_far]
         self.folder_tree.expandAll()
         self.folder_tree.setCurrentItem(root_item)
 
     def _folder_selected(self, current, _prev):
-        if not current or not self.archive: return
-        folder = current.data(0, Qt.UserRole)
-        text   = self.le_filter.text().lower()
-        entries = []
-        for e in self.archive.files:
-            if folder and not e.name.replace("\\", "/").startswith(folder): continue
-            if text and text not in e.name.lower(): continue
-            entries.append(e)
-        self._populate_file_table(entries)
+        self._repopulate_file_list_from_filter()
 
     # ── File table ────────────────────────────────────────────────────────────
 
-    def _populate_file_table(self, entries: List[BA2FileEntry]):
+    def _populate_file_table(self, items: List[Tuple[BA2Archive, BA2FileEntry]]):
         self.file_table.setSortingEnabled(False)
         self.file_table.setRowCount(0)
 
-        GREEN  = QColor("#2f8c2f")
-        RED    = QColor("#c84b2f")
-        BLUE   = QColor("#2f7ac8")
+        GREEN = QColor("#2f8c2f")
+        RED = QColor("#c84b2f")
+        BLUE = QColor("#2f7ac8")
 
-        def row_for(e: BA2FileEntry, tag: str = "", color: QColor = None):
+        def row_for(arc: BA2Archive, e: BA2FileEntry, tag: str = "", color: QColor = None):
             r = self.file_table.rowCount()
             self.file_table.insertRow(r)
+            stem = os.path.basename(arc.path)
+            c_arch = QTableWidgetItem(stem)
+            c_arch.setFlags(c_arch.flags() & ~Qt.ItemIsEditable)
+            self.file_table.setItem(r, 0, c_arch)
             display_name = e.filename + (f"  [{tag}]" if tag else "")
-            col0 = QTableWidgetItem(display_name)
-            col0.setData(Qt.UserRole, e)
-            if color: col0.setForeground(color)
-            self.file_table.setItem(r, 0, col0)
-            self.file_table.setItem(r, 1, QTableWidgetItem(e.directory))
+            c_fn = QTableWidgetItem(display_name)
+            c_fn.setData(Qt.UserRole, (arc, e))
+            if color:
+                c_fn.setForeground(color)
+            self.file_table.setItem(r, 1, c_fn)
+            self.file_table.setItem(r, 2, QTableWidgetItem(e.directory))
             sz = QTableWidgetItem(fmt_size(e.unpacked_size))
             sz.setData(Qt.UserRole + 1, e.unpacked_size)
-            self.file_table.setItem(r, 2, sz)
-            self.file_table.setItem(r, 3, QTableWidgetItem("Yes" if e.is_compressed else "No"))
-            self.file_table.setItem(r, 4, QTableWidgetItem(e.format_name))
+            self.file_table.setItem(r, 3, sz)
+            self.file_table.setItem(r, 4, QTableWidgetItem("Yes" if e.is_compressed else "No"))
+            self.file_table.setItem(r, 5, QTableWidgetItem(e.format_name))
             dims = f"{e.width} × {e.height}" if e.is_texture and e.width else ""
-            self.file_table.setItem(r, 5, QTableWidgetItem(dims))
+            self.file_table.setItem(r, 6, QTableWidgetItem(dims))
             mips = str(e.num_mips) if e.is_texture else ""
-            self.file_table.setItem(r, 6, QTableWidgetItem(mips))
+            self.file_table.setItem(r, 7, QTableWidgetItem(mips))
 
-        for e in entries:
+        for arc, e in items:
             if e.name in self.deleted:
-                row_for(e, "DELETED", RED)
+                row_for(arc, e, "DELETED", RED)
             elif e.name in self.replacements:
-                row_for(e, "REPLACED", BLUE)
+                row_for(arc, e, "REPLACED", BLUE)
             else:
-                row_for(e)
+                row_for(arc, e)
 
-        # Pending adds
-        for iname, src in self.pending_adds.items():
-            ne = BA2FileEntry()
-            ne.name = iname
-            try:
-                ne.unpacked_size = os.path.getsize(src)
-            except Exception:
-                pass
-            row_for(ne, "NEW", GREEN)
+        if len(self.archives) == 1:
+            arc0 = self.archives[0]
+            for iname, src in self.pending_adds.items():
+                ne = BA2FileEntry()
+                ne.name = iname
+                try:
+                    ne.unpacked_size = os.path.getsize(src)
+                except Exception:
+                    pass
+                row_for(arc0, ne, "NEW", GREEN)
 
         self.file_table.setSortingEnabled(True)
         self._refresh_statusbar()
 
     def _apply_filter(self, text: str):
-        if not self.archive: return
-        low = text.lower()
-        entries = [e for e in self.archive.files if low in e.name.lower()] if low else self.archive.files
-        self._populate_file_table(entries)
+        self._repopulate_file_list_from_filter()
 
     def _clear_filter(self):
         self.le_filter.clear()
@@ -1771,13 +1830,20 @@ class BA2Manager(QMainWindow):
     def _select_all(self):
         self.file_table.selectAll()
 
-    def _selected_entries(self) -> List[BA2FileEntry]:
-        seen = set(); result = []
+    def _selected_arc_entries(self) -> List[Tuple[BA2Archive, BA2FileEntry]]:
+        seen = set()
+        result: List[Tuple[BA2Archive, BA2FileEntry]] = []
         for item in self.file_table.selectedItems():
-            if item.column() != 0: continue
-            e = item.data(Qt.UserRole)
-            if e and e.name not in seen:
-                seen.add(e.name); result.append(e)
+            if item.column() != 1:
+                continue
+            data = item.data(Qt.UserRole)
+            if not data:
+                continue
+            arc, e = data
+            key = (arc.path, e.name)
+            if key not in seen:
+                seen.add(key)
+                result.append((arc, e))
         return result
 
     # ── Context menu ──────────────────────────────────────────────────────────
@@ -1798,34 +1864,41 @@ class BA2Manager(QMainWindow):
     # ── Extract ───────────────────────────────────────────────────────────────
 
     def _extract_selected(self):
-        if not self.archive: return
-        entries = self._selected_entries()
-        if not entries:
-            QMessageBox.information(self, "Nothing Selected", "Select files to extract."); return
-        # Filter out deleted/pending-adds (no data to read)
-        entries = [e for e in entries if e.name not in self.deleted and e.name not in self.pending_adds]
-        self._do_extract(entries)
+        if not self.archives:
+            return
+        items = self._selected_arc_entries()
+        if not items:
+            QMessageBox.information(self, "Nothing Selected", "Select files to extract.")
+            return
+        items = [
+            (a, e) for a, e in items
+            if e.name not in self.deleted and e.name not in self.pending_adds
+        ]
+        self._do_extract(items)
 
     def _extract_all(self):
-        if not self.archive: return
-        self._do_extract(self.archive.files)
+        if not self.archives:
+            return
+        self._do_extract(self._all_arc_entries())
 
     def _worker_busy(self) -> bool:
         return self._worker is not None and self._worker.isRunning()
 
-    def _do_extract(self, entries: List[BA2FileEntry]):
+    def _do_extract(self, items: List[Tuple[BA2Archive, BA2FileEntry]]):
         if self._worker_busy():
             QMessageBox.warning(
                 self, "Busy", "Please wait for the current operation to finish before extracting."
             )
             return
         out_dir = QFileDialog.getExistingDirectory(self, "Extract To Folder")
-        if not out_dir: return
+        if not out_dir:
+            return
 
         prog = WorkProgressDialog("Extracting", self)
         prog.show()
 
-        worker = ExtractWorker(self.archive, entries, out_dir)
+        use_sub = len(self.archives) > 1
+        worker = ExtractWorker(items, out_dir, use_sub)
         self._worker = worker
 
         def on_progress(cur, total, name):
@@ -1880,77 +1953,107 @@ class BA2Manager(QMainWindow):
     # ── Add / Replace / Delete ────────────────────────────────────────────────
 
     def _add_files(self):
-        if not self.archive:
-            QMessageBox.information(self, "No Archive", "Open an archive first."); return
-        dlg = AddFilesDialog(self.archive.is_texture, self)
-        if dlg.exec_() != QDialog.Accepted: return
+        if len(self.archives) != 1:
+            QMessageBox.information(
+                self, "One Archive Only",
+                "Add / replace / delete / save work on a single BA2.\n"
+                "Close extra archives (File → Close) or open one archive only.",
+            )
+            return
+        arc = self.archives[0]
+        dlg = AddFilesDialog(arc.is_texture, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
         new_items = dlg.get_result()
         for iname, src in new_items.items():
             self.pending_adds[iname] = src
         self._mark_dirty()
-        self._populate_file_table(self.archive.files)
+        self._repopulate_file_list_from_filter()
         self._update_pending_tab()
 
     def _replace_selected(self):
-        if not self.archive: return
-        entries = self._selected_entries()
-        if len(entries) != 1:
-            QMessageBox.information(self, "Select One File",
-                "Select exactly one file to replace."); return
-        e = entries[0]
-        filt = "DDS Textures (*.dds);;All Files (*)" if self.archive.is_texture else "All Files (*)"
+        if len(self.archives) != 1:
+            QMessageBox.information(
+                self, "One Archive Only",
+                "Replace works on a single open BA2.",
+            )
+            return
+        arc = self.archives[0]
+        items = self._selected_arc_entries()
+        if len(items) != 1:
+            QMessageBox.information(self, "Select One File", "Select exactly one file to replace.")
+            return
+        _, e = items[0]
+        filt = "DDS Textures (*.dds);;All Files (*)" if arc.is_texture else "All Files (*)"
         src, _ = QFileDialog.getOpenFileName(
             self, f"Replace  '{e.filename}'  with…", "", filt)
-        if not src: return
+        if not src:
+            return
         self.replacements[e.name] = src
         self._mark_dirty()
-        self._populate_file_table(self.archive.files)
+        self._repopulate_file_list_from_filter()
         self._update_pending_tab()
 
     def _delete_selected(self):
-        if not self.archive: return
-        entries = self._selected_entries()
-        if not entries: return
+        if len(self.archives) != 1:
+            QMessageBox.information(
+                self, "One Archive Only",
+                "Delete works on a single open BA2.",
+            )
+            return
+        items = self._selected_arc_entries()
+        if not items:
+            return
         r = QMessageBox.question(
             self, "Delete Files",
-            f"Mark {len(entries)} file(s) for deletion?\n"
+            f"Mark {len(items)} file(s) for deletion?\n"
             "(Applied when you save the archive.)",
             QMessageBox.Yes | QMessageBox.No)
-        if r != QMessageBox.Yes: return
-        for e in entries:
+        if r != QMessageBox.Yes:
+            return
+        for _a, e in items:
             self.deleted.add(e.name)
         self._mark_dirty()
-        self._populate_file_table(self.archive.files)
+        self._repopulate_file_list_from_filter()
         self._update_pending_tab()
 
     # ── Save ──────────────────────────────────────────────────────────────────
 
     def _save_archive(self):
-        if not self.archive: return
+        if len(self.archives) != 1:
+            return
+        arc = self.archives[0]
         if not self.dirty:
-            QMessageBox.information(self, "Nothing to Save", "No pending changes."); return
-        self._do_rebuild(self.archive.path)
+            QMessageBox.information(self, "Nothing to Save", "No pending changes.")
+            return
+        self._do_rebuild(arc.path)
 
     def _save_archive_as(self):
-        if not self.archive: return
+        if len(self.archives) != 1:
+            return
+        arc = self.archives[0]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Archive As", self.archive.path,
+            self, "Save Archive As", arc.path,
             "BA2 Archives (*.ba2);;All Files (*)")
-        if not path: return
+        if not path:
+            return
         self._do_rebuild(path)
 
     def _do_rebuild(self, out_path: str):
+        if len(self.archives) != 1:
+            return
+        arc = self.archives[0]
         if self._worker_busy():
             QMessageBox.warning(
                 self, "Busy", "Please wait for the current operation to finish before saving."
             )
             return
-        total = len(self.archive.files) + len(self.pending_adds)
-        prog  = WorkProgressDialog("Saving Archive", self)
+        total = len(arc.files) + len(self.pending_adds)
+        prog = WorkProgressDialog("Saving Archive", self)
         prog.show()
 
         worker = RebuildWorker(
-            self.archive, dict(self.pending_adds),
+            arc, dict(self.pending_adds),
             set(self.deleted), dict(self.replacements), out_path)
         self._worker = worker
 
@@ -1972,35 +2075,45 @@ class BA2Manager(QMainWindow):
     # ── Info tabs ─────────────────────────────────────────────────────────────
 
     def _update_info(self):
-        if not self.archive: self.info_text.clear(); return
-        arc = self.archive
-        lines = [
-            f"  Path         {arc.path}",
-            f"  Type         {arc.type_name}",
-            f"  Version      {_archive_version_label(arc.version)} (header v{arc.version})",
-            f"  Files        {len(arc.files):,}",
-            f"  Total size   {fmt_size(arc.total_size)}",
-            f"  File size    {fmt_size(os.path.getsize(arc.path))}",
-            "",
-        ]
-        if arc.is_texture:
-            fmts: Dict[str, int] = {}
-            for e in arc.files:
-                fmts[e.format_name] = fmts.get(e.format_name, 0) + 1
-            lines.append("  Texture Formats:")
-            for fn, cnt in sorted(fmts.items(), key=lambda x: -x[1]):
-                lines.append(f"    {fn:<34} {cnt:>5} files")
-        else:
-            comp = sum(1 for e in arc.files if e.is_compressed)
-            lines.append(f"  Compressed   {comp:,} / {len(arc.files):,}")
-            exts: Dict[str, int] = {}
-            for e in arc.files:
-                exts[e.ext] = exts.get(e.ext, 0) + 1
+        if not self.archives:
+            self.info_text.clear()
+            return
+        lines: List[str] = []
+        if len(self.archives) > 1:
+            lines.append(f"  Open archives: {len(self.archives)}")
+            lines.append(f"  Combined files: {sum(len(a.files) for a in self.archives):,}")
             lines.append("")
-            lines.append("  Extensions:")
-            for ext, cnt in sorted(exts.items(), key=lambda x: -x[1]):
-                lines.append(f"    .{ext:<10} {cnt:>5} files")
-        self.info_text.setPlainText("\n".join(lines))
+        for i, arc in enumerate(self.archives, 1):
+            label = f"  [{i}] " if len(self.archives) > 1 else "  "
+            lines.extend([
+                f"{label}{os.path.basename(arc.path)}",
+                f"      Path         {arc.path}",
+                f"      Type         {arc.type_name}",
+                f"      Version      {_archive_version_label(arc.version)} (header v{arc.version})",
+                f"      Files        {len(arc.files):,}",
+                f"      Total size   {fmt_size(arc.total_size)}",
+                f"      File size    {fmt_size(os.path.getsize(arc.path))}",
+                "",
+            ])
+            if arc.is_texture:
+                fmts: Dict[str, int] = {}
+                for e in arc.files:
+                    fmts[e.format_name] = fmts.get(e.format_name, 0) + 1
+                lines.append("      Texture Formats:")
+                for fn, cnt in sorted(fmts.items(), key=lambda x: -x[1]):
+                    lines.append(f"        {fn:<32} {cnt:>5} files")
+            else:
+                comp = sum(1 for e in arc.files if e.is_compressed)
+                lines.append(f"      Compressed   {comp:,} / {len(arc.files):,}")
+                exts: Dict[str, int] = {}
+                for e in arc.files:
+                    exts[e.ext] = exts.get(e.ext, 0) + 1
+                lines.append("")
+                lines.append("      Extensions:")
+                for ext, cnt in sorted(exts.items(), key=lambda x: -x[1]):
+                    lines.append(f"        .{ext:<8} {cnt:>5} files")
+            lines.append("")
+        self.info_text.setPlainText("\n".join(lines).rstrip())
 
     def _update_pending_tab(self):
         lines = []
@@ -2038,11 +2151,16 @@ class BA2Manager(QMainWindow):
         self._refresh_actions()
 
     def _refresh_statusbar(self):
-        if self.archive:
-            self.sb_name.setText(f"  {os.path.basename(self.archive.path)}  [{self.archive.type_name}]")
+        if self.archives:
+            if len(self.archives) == 1:
+                a0 = self.archives[0]
+                self.sb_name.setText(f"  {os.path.basename(a0.path)}  [{a0.type_name}]")
+            else:
+                self.sb_name.setText(f"  {len(self.archives)} archives open")
             n = self.file_table.rowCount()
-            self.sb_count.setText(f"  {n:,} files  ")
-            self.sb_size.setText(f"  {fmt_size(self.archive.total_size)}  ")
+            self.sb_count.setText(f"  {n:,} listed  ")
+            tot = sum(a.total_size for a in self.archives)
+            self.sb_size.setText(f"  {fmt_size(tot)} total  ")
         else:
             self.sb_name.setText("  No archive open")
             self.sb_count.setText("")
@@ -2050,13 +2168,14 @@ class BA2Manager(QMainWindow):
         self.sb_dirty.setText("  ● UNSAVED CHANGES  " if self.dirty else "")
 
     def _refresh_actions(self):
-        has = self.archive is not None
-        for a in [self.act_close, self.act_save, self.act_save_as,
-                  self.act_add, self.act_rep, self.act_del, self.act_selall,
-                  self.act_ext_sel, self.act_ext_all,
-                  self.tb_save, self.tb_ext_sel, self.tb_ext_all,
-                  self.tb_add, self.tb_rep, self.tb_del]:
+        has = bool(self.archives)
+        can_edit = len(self.archives) == 1
+        for a in [self.act_close, self.act_selall, self.act_ext_sel, self.act_ext_all,
+                  self.tb_ext_sel, self.tb_ext_all]:
             a.setEnabled(has)
+        for a in [self.act_save, self.act_save_as, self.act_add, self.act_rep, self.act_del,
+                  self.tb_save, self.tb_add, self.tb_rep, self.tb_del]:
+            a.setEnabled(has and can_edit)
 
     def _about(self):
         QMessageBox.about(self, "About BA2 Manager",
@@ -2074,8 +2193,10 @@ class BA2Manager(QMainWindow):
 
     def closeEvent(self, event):
         if self.dirty and not self._confirm_discard():
-            event.ignore(); return
-        if self.archive: self.archive.close()
+            event.ignore()
+            return
+        for a in self.archives:
+            a.close()
         event.accept()
 
 
